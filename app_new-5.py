@@ -13,7 +13,7 @@ def get_all_market_data(token, target_date):
         # 修正重點：明確傳入 data_id=""，解決 "can't be none" 的錯誤
         df = api.get_data(
             dataset="TaiwanStockTradingDailyReport",
-            data_id="all",  # 關鍵修正：傳入空字串代表抓取全市場
+            data_id="0000",  # 關鍵修正：傳入空字串代表抓取全市場
             start_date=target_date,
             end_date=target_date
         )
