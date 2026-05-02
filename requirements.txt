@@ -4,5 +4,3 @@ pandas
 pandas-ta
 requests
 FinMind
-urllib3
-numpy
