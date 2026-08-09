@@ -1,68 +1,87 @@
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
-
 import streamlit as st
 
-st.write("測試：Streamlit 成功啟動！")
+# --- 頁面基本設定 ---
+st.set_page_config(
+    page_title="台股籌碼與技術面篩選工具", page_icon="📈", layout="wide"
+)
 
-def get_institutional_buy_before_date(target_date_str, n_days=5, token=""):
-    """抓取指定日期的前 N 個交易日法人買賣超資料
+st.title("📈 台股三大法人籌碼篩選工具")
+st.markdown("快速查詢指定日期前 **N 個交易日** 的外資/投信/自營商累計買超個股。")
 
-    :param target_date_str: 指定日期 (格式: 'YYYY-MM-DD')
-    :param n_days: 往前計算的交易日天數 (預設 5 天)
-    :param token: FinMind 免費 API Token
-    """
-    # 1. 計算 start_date（往前推 n_days * 2.5 天，確保涵蓋週末與例假日）
+# --- 側邊欄：使用者參數設定 ---
+st.sidebar.header("⚙️ 篩選條件設定")
+
+# 1. FinMind Token 輸入 (建議輸入免費 Token)
+finmind_token = st.sidebar.text_input(
+    "FinMind API Token (選填)",
+    value="",
+    type="password",
+    help="輸入免費申請的 Token 可享每小時 600 次請求。若留空則使用預設匿名權限。",
+)
+
+# 2. 法人類別選擇
+investor_type = st.sidebar.selectbox(
+    "選擇法人類別",
+    options=["Foreign_Investor", "Investment_Trust", "Dealer_Self"],
+    format_func=lambda x: {
+        "Foreign_Investor": "外資",
+        "Investment_Trust": "投信",
+        "Dealer_Self": "自營商",
+    }[x],
+)
+
+# 3. 指定基準日期 (預設為今天)
+target_date = st.sidebar.date_input("選擇基準日期", value=datetime.today())
+
+# 4. 往前計算的天數 N
+n_days = st.sidebar.slider("往前計算交易日天數 (N)", min_value=1, max_value=20, value=5)
+
+
+# --- 資料抓取與快取函式 ---
+@st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
+def fetch_institutional_data(target_date_str, n_days, token, investor_code):
+    # 往前推算足夠的天數 (天數 * 2.5 確保涵蓋週末與假期)
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     start_dt = target_dt - timedelta(days=int(n_days * 2.5))
     start_date_str = start_dt.strftime("%Y-%m-%d")
 
-    # 2. 設定 FinMind API 參數
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
         "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
         "start_date": start_date_str,
-        "end_date": target_date_str,  # 指定結束日期為我們的目標日
-        "token": token,
+        "end_date": target_date_str,
     }
+    if token:
+        params["token"] = token
 
-    print(
-        f"正在抓取 {start_date_str} 至 {target_date_str} 的三大法人資料..."
+    # 發起 API 請求，設定 10 秒 Timeout
+    res = requests.get(url, params=params, timeout=10)
+    data = res.json()
+
+    if "data" not in data or not data["data"]:
+        return None, []
+
+    df = pd.DataFrame(data["data"])
+
+    # 篩選特定法人
+    df_filtered = df[df["name"] == investor_code].copy()
+
+    # 取出實際有交易的日期並切出最後 N 天
+    available_dates = sorted(df_filtered["date"].unique())
+    selected_dates = (
+        available_dates[-n_days:]
+        if len(available_dates) >= n_days
+        else available_dates
     )
-    res = requests.get(url, params=params).json()
 
-    if "data" not in res or not res["data"]:
-        print("未抓取到資料，請檢查日期或 Token 是否正確。")
-        return None
-
-    df = pd.DataFrame(res["data"])
-
-    # 3. 篩選外資資料 (Foreign_Investor)
-    df_foreign = df[df["name"] == "Foreign_Investor"].copy()
-
-    # 4. 取得該區間內「實際有交易」的日期列表，並只留最後 N 個交易日
-    available_dates = sorted(df_foreign["date"].unique())
-
-    if len(available_dates) < n_days:
-        print(
-            f"⚠️ 警告：該區間內的有效交易日只有 {len(available_dates)} 天，不足 {n_days} 天。"
-        )
-        selected_dates = available_dates
-    else:
-        selected_dates = available_dates[-n_days:]
-
-    print(
-        f"✅ 成功鎖定以 {target_date_str} 為基準的前 {len(selected_dates)} 個交易日："
-    )
-    print(selected_dates)
-
-    # 5. 過濾出這 N 個交易日的資料並計算累計買超
-    df_n_days = df_foreign[df_foreign["date"].isin(selected_dates)].copy()
-
-    # 計算淨買超股數，並轉為「張數」
+    # 過濾資料並計算累計買超
+    df_n_days = df_filtered[df_filtered["date"].isin(selected_dates)].copy()
     df_n_days["net_buy_shares"] = df_n_days["buy"] - df_n_days["sell"]
 
+    # 依股票代號加總
     df_summary = (
         df_n_days.groupby("stock_id")["net_buy_shares"].sum().reset_index()
     )
@@ -70,23 +89,73 @@ def get_institutional_buy_before_date(target_date_str, n_days=5, token=""):
         df_summary["net_buy_shares"] / 1000
     ).astype(int)
 
-    # 6. 依買超張數由大到小排序
-    df_result = df_summary.sort_values(by="net_buy_lots", ascending=False)
+    # 排序
+    df_result = df_summary.sort_values(
+        by="net_buy_lots", ascending=False
+    ).reset_index(drop=True)
 
-    return df_result
+    return df_result, selected_dates
 
 
-# --- 使用測試 ---
-MY_TOKEN = "你的FinMind_Token"  # 填入免費申請的 Token
-TARGET_DATE = "2026-08-05"  # 指定任何你想查詢的歷史日期
+# --- 主畫面渲染邏輯 ---
+date_str = target_date.strftime("%Y-%m-%d")
 
-# 抓取 2026-08-05（含）往前 5 個交易日的外資買超排行
-df_top_buy = get_institutional_buy_before_date(
-    target_date_str=TARGET_DATE, n_days=5, token=MY_TOKEN
-)
+# 顯示載入動畫
+with st.spinner("正在連線抓取籌碼資料，請稍後..."):
+    try:
+        df_result, actual_dates = fetch_institutional_data(
+            date_str, n_days, finmind_token, investor_type
+        )
 
-if df_top_buy is not None:
-    print(
-        f"\n🔥 {TARGET_DATE} 前 5 個交易日外資買超前 10 名（張）："
-    )
-    print(df_top_buy.head(10).to_string(index=False))
+        if df_result is not None and not df_result.empty:
+            investor_name_map = {
+                "Foreign_Investor": "外資",
+                "Investment_Trust": "投信",
+                "Dealer_Self": "自營商",
+            }
+            inv_name = investor_name_map[investor_type]
+
+            st.success(f"✅ 成功取得資料！")
+
+            # 顯示實際採計的交易日
+            st.info(
+                f"📅 **實際採計的 {len(actual_dates)} 個交易日：** "
+                + ", ".join(actual_dates)
+            )
+
+            # 指標卡片 (Metrics)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("買超第一名", df_result.iloc[0]["stock_id"])
+            col2.metric("最高買超張數", f"{df_result.iloc[0]['net_buy_lots']:,} 張")
+            col3.metric("符合條件股票總數", f"{len(df_result)} 支")
+
+            st.divider()
+
+            # 呈現表格
+            st.subheader(f"🔥 {inv_name} 累計買超排行榜 (前 50 名)")
+
+            # 重命名欄位讓介面更漂亮
+            df_display = df_result.rename(
+                columns={
+                    "stock_id": "股票代號",
+                    "net_buy_lots": f"{inv_name}累計買超(張)",
+                    "net_buy_shares": "累計買超(股)",
+                }
+            )
+
+            # 只顯示前 50 名
+            st.dataframe(
+                df_display[
+                    ["股票代號", f"{inv_name}累計買超(張)"]
+                ].head(50),
+                use_container_width=True,
+                height=500,
+            )
+
+        else:
+            st.warning("⚠️ 查無資料，可能原因：該區間為休市日、或 API 額度達到上限。")
+
+    except requests.exceptions.Timeout:
+        st.error("❌ 連線逾時！FinMind 伺服器回應過慢，請重新整理頁面再試一次。")
+    except Exception as e:
+        st.error(f"❌ 發生未預期的錯誤：{e}")
