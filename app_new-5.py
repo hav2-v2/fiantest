@@ -2,6 +2,9 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 
+import streamlit as st
+
+st.write("測試：Streamlit 成功啟動！")
 
 def get_institutional_buy_before_date(target_date_str, n_days=5, token=""):
     """抓取指定日期的前 N 個交易日法人買賣超資料
