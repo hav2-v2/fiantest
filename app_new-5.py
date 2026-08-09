@@ -1,69 +1,89 @@
-import streamlit as st
+from datetime import datetime, timedelta
 import pandas as pd
-from FinMind.data import DataLoader
-from datetime import datetime
+import requests
 
-# 使用快取功能：同一天、同個 Token 的查詢結果會暫存在記憶體
-@st.cache_data(ttl=3600)  # 快取 1 小時
-def get_all_market_data(token, target_date):
-    try:
-        api = DataLoader()
-        api.login_by_token(api_token=token)
-        
-        # 修正重點：明確傳入 data_id=""，解決 "can't be none" 的錯誤
-        df = api.get_data(
-            dataset="TaiwanStockTradingDailyReport",
-            data_id="0000",  # 關鍵修正：傳入空字串代表抓取全市場
-            start_date=target_date,
-            end_date=target_date
+
+def get_institutional_buy_before_date(target_date_str, n_days=5, token=""):
+    """抓取指定日期的前 N 個交易日法人買賣超資料
+
+    :param target_date_str: 指定日期 (格式: 'YYYY-MM-DD')
+    :param n_days: 往前計算的交易日天數 (預設 5 天)
+    :param token: FinMind 免費 API Token
+    """
+    # 1. 計算 start_date（往前推 n_days * 2.5 天，確保涵蓋週末與例假日）
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    start_dt = target_dt - timedelta(days=int(n_days * 2.5))
+    start_date_str = start_dt.strftime("%Y-%m-%d")
+
+    # 2. 設定 FinMind API 參數
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+        "start_date": start_date_str,
+        "end_date": target_date_str,  # 指定結束日期為我們的目標日
+        "token": token,
+    }
+
+    print(
+        f"正在抓取 {start_date_str} 至 {target_date_str} 的三大法人資料..."
+    )
+    res = requests.get(url, params=params).json()
+
+    if "data" not in res or not res["data"]:
+        print("未抓取到資料，請檢查日期或 Token 是否正確。")
+        return None
+
+    df = pd.DataFrame(res["data"])
+
+    # 3. 篩選外資資料 (Foreign_Investor)
+    df_foreign = df[df["name"] == "Foreign_Investor"].copy()
+
+    # 4. 取得該區間內「實際有交易」的日期列表，並只留最後 N 個交易日
+    available_dates = sorted(df_foreign["date"].unique())
+
+    if len(available_dates) < n_days:
+        print(
+            f"⚠️ 警告：該區間內的有效交易日只有 {len(available_dates)} 天，不足 {n_days} 天。"
         )
-        
-        if df is not None and not df.empty:
-            df.columns = [c.lower() for c in df.columns]
-            return df
-        return None
-    except Exception as e:
-        # 將錯誤詳細資訊印出來，方便除錯
-        st.error(f"FinMind API 回傳錯誤：{e}")
-        return None
-
-# --- Streamlit 介面 ---
-st.title("🏛️ 台股全市場行情快速掃描")
-
-# 側邊欄設定
-with st.sidebar:
-    st.header("1. 認證")
-    token = st.text_input("輸入 FinMind Token", type="password").strip()
-    st.header("2. 查詢設定")
-    # 預設為昨天，因為當天盤後資料通常下午 4 點才齊全
-    target_date = st.date_input("選擇交易日期", value=datetime(2026, 4, 30)) 
-    fetch_btn = st.button("🚀 執行一鍵全市場抓取")
-
-# 按鈕觸發邏輯
-if fetch_btn:
-    if not token:
-        st.warning("請在左側欄輸入您的 FinMind Token。")
+        selected_dates = available_dates
     else:
-        date_str = target_date.strftime("%Y-%m-%d")
-        with st.spinner(f"正在向 FinMind 請求 {date_str} 的全市場行情..."):
-            df = get_all_market_data(token, date_str)
-            
-            if df is not None:
-                st.success(f"抓取成功！共計 {len(df)} 檔股票資料。")
-                
-                # 簡單計算統計數據
-                # 注意：spread 可能是字串或數值，視 API 版本而定，這裡做數值轉換確保正確
-                df['spread'] = pd.to_numeric(df['spread'], errors='coerce')
-                up_count = len(df[df['spread'] > 0])
-                down_count = len(df[df['spread'] < 0])
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("今日上漲", f"{up_count} 家")
-                c2.metric("今日下跌", f"{down_count} 家")
-                c3.metric("資料總數", f"{len(df)} 檔")
+        selected_dates = available_dates[-n_days:]
 
-                # 顯示資料表
-                st.subheader("📋 完整行情清單")
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info(f"【{date_str}】查無資料。請注意：\n1. 假日不開盤。\n2. 當日資料通常在 15:30 後才更新。")
+    print(
+        f"✅ 成功鎖定以 {target_date_str} 為基準的前 {len(selected_dates)} 個交易日："
+    )
+    print(selected_dates)
+
+    # 5. 過濾出這 N 個交易日的資料並計算累計買超
+    df_n_days = df_foreign[df_foreign["date"].isin(selected_dates)].copy()
+
+    # 計算淨買超股數，並轉為「張數」
+    df_n_days["net_buy_shares"] = df_n_days["buy"] - df_n_days["sell"]
+
+    df_summary = (
+        df_n_days.groupby("stock_id")["net_buy_shares"].sum().reset_index()
+    )
+    df_summary["net_buy_lots"] = (
+        df_summary["net_buy_shares"] / 1000
+    ).astype(int)
+
+    # 6. 依買超張數由大到小排序
+    df_result = df_summary.sort_values(by="net_buy_lots", ascending=False)
+
+    return df_result
+
+
+# --- 使用測試 ---
+MY_TOKEN = "你的FinMind_Token"  # 填入免費申請的 Token
+TARGET_DATE = "2026-08-05"  # 指定任何你想查詢的歷史日期
+
+# 抓取 2026-08-05（含）往前 5 個交易日的外資買超排行
+df_top_buy = get_institutional_buy_before_date(
+    target_date_str=TARGET_DATE, n_days=5, token=MY_TOKEN
+)
+
+if df_top_buy is not None:
+    print(
+        f"\n🔥 {TARGET_DATE} 前 5 個交易日外資買超前 10 名（張）："
+    )
+    print(df_top_buy.head(10).to_string(index=False))
