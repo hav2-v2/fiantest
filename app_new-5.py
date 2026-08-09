@@ -13,10 +13,13 @@ st.markdown("快速查詢指定日期前 **N 個交易日** 的外資/投信/自
 
 
 # --- 資料抓取與快取函式 ---
-@st.cache_data(ttl=3600)  # 快取 1 小時
+@st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def fetch_institutional_data(target_date_str, n_days, token, investor_code):
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    start_dt = target_dt - timedelta(days=int(n_days * 2.5))
+
+    # 💡 關鍵修復：不管 N 是多少，start_date 至少保底往前推算 10 天，確保能涵蓋假日與休市
+    days_back = max(int(n_days * 2.5), 10)
+    start_dt = target_dt - timedelta(days=days_back)
     start_date_str = start_dt.strftime("%Y-%m-%d")
 
     url = "https://api.finmindtrade.com/api/v4/data"
@@ -28,6 +31,7 @@ def fetch_institutional_data(target_date_str, n_days, token, investor_code):
     if token:
         params["token"] = token
 
+    # 發起 API 請求，設定 10 秒 Timeout 避免卡死
     res = requests.get(url, params=params, timeout=10)
     data = res.json()
 
@@ -37,6 +41,10 @@ def fetch_institutional_data(target_date_str, n_days, token, investor_code):
     df = pd.DataFrame(data["data"])
     df_filtered = df[df["name"] == investor_code].copy()
 
+    if df_filtered.empty:
+        return None, []
+
+    # 取出實際有交易的日期，並切出最後 N 天
     available_dates = sorted(df_filtered["date"].unique())
     selected_dates = (
         available_dates[-n_days:]
@@ -44,9 +52,11 @@ def fetch_institutional_data(target_date_str, n_days, token, investor_code):
         else available_dates
     )
 
+    # 過濾資料並計算累計買超
     df_n_days = df_filtered[df_filtered["date"].isin(selected_dates)].copy()
     df_n_days["net_buy_shares"] = df_n_days["buy"] - df_n_days["sell"]
 
+    # 依股票代號加總
     df_summary = (
         df_n_days.groupby("stock_id")["net_buy_shares"].sum().reset_index()
     )
@@ -54,6 +64,7 @@ def fetch_institutional_data(target_date_str, n_days, token, investor_code):
         df_summary["net_buy_shares"] / 1000
     ).astype(int)
 
+    # 排序
     df_result = df_summary.sort_values(
         by="net_buy_lots", ascending=False
     ).reset_index(drop=True)
@@ -69,7 +80,7 @@ with st.sidebar.form(key="filter_form"):
         "FinMind API Token (選填)",
         value="",
         type="password",
-        help="輸入免費 Token 享每小時 600 次請求",
+        help="輸入免費申請的 Token 可享每小時 600 次請求。若留空則使用預設匿名權限。",
     )
 
     investor_type = st.selectbox(
@@ -88,7 +99,7 @@ with st.sidebar.form(key="filter_form"):
         "往前計算交易日天數 (N)", min_value=1, max_value=20, value=5
     )
 
-    # 🔘 這就是送出按鈕！點擊後才會開始執行後續程式碼
+    # 🔘 送出按鈕：點擊後才會發射 API 請求
     submit_button = st.form_submit_button(
         label="🚀 開始查詢", use_container_width=True
     )
@@ -113,11 +124,14 @@ if submit_button:
                 inv_name = investor_name_map[investor_type]
 
                 st.success("✅ 成功取得資料！")
+
+                # 顯示實際採計的交易日細節
                 st.info(
                     f"📅 **實際採計的 {len(actual_dates)} 個交易日：** "
                     + ", ".join(actual_dates)
                 )
 
+                # 指標卡片 (Metrics)
                 col1, col2, col3 = st.columns(3)
                 col1.metric("買超第一名", df_result.iloc[0]["stock_id"])
                 col2.metric(
@@ -127,6 +141,7 @@ if submit_button:
 
                 st.divider()
 
+                # 呈現表格 (前 50 名)
                 st.subheader(f"🔥 {inv_name} 累計買超排行榜 (前 50 名)")
 
                 df_display = df_result.rename(
